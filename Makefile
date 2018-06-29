@@ -14,14 +14,7 @@ build-docker-image:
 	$(SUDO) docker build -t $(DOCKER_IMAGE) -f $(DOCKER_FILE) .
 
 build-ebpf-object:
-	$(SUDO) docker run --rm -e DEBUG=$(DEBUG) \
-		-e CIRCLE_BUILD_URL=$(CIRCLE_BUILD_URL) \
-		-v $(PWD):/src:ro \
-		-v $(PWD)/ebpf:/dist/ \
-		--workdir=/src \
-		$(DOCKER_IMAGE) \
-		make -f ebpf.mk build
-	sudo chown -R $(UID):$(UID) ebpf
+	$(SUDO) docker run -e DEBUG=$(DEBUG) -e CIRCLE_BUILD_URL=$(CIRCLE_BUILD_URL) $(DOCKER_IMAGE) bash
 
 install-generated-go:
 	cp ebpf/tcptracer-ebpf.go pkg/tracer/tcptracer-ebpf.go
@@ -32,3 +25,17 @@ delete-docker-image:
 lint:
 	./tools/lint -ignorespelling "agre " -ignorespelling "AGRE " .
 	./tools/shell-lint .
+
+# run the test suite in docker.
+test-in-docker: all
+	docker run -ti --privileged --net=host --pid=host $(DOCKER_IMAGE) make -f docker.mk docker-test
+
+# start the test tracer in docker.
+# enter the docker image and start tcp connections to test.
+start-in-docker: all
+	docker run -ti --privileged --net=host --pid=host $(DOCKER_IMAGE) make -f docker.mk docker-start
+
+# enter the docker image in another tab to test the tracer.
+# try wget google.com, etc.
+enter-docker-image: all
+	docker run -ti --privileged --net=host --pid=host $(DOCKER_IMAGE) bash
