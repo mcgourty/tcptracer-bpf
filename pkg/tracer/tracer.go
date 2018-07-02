@@ -6,12 +6,15 @@ import (
 	"bytes"
 	"fmt"
 	"unsafe"
-
 	bpflib "github.com/iovisor/gobpf/elf"
 )
 
-type Tracer struct {
+// tracer listens for TCP connections and sends events along
+// an event channel.
+type tracer struct {
 	m           *bpflib.Module
+	eventC     chan Event
+	doneC       chan struct{}
 	perfMapIPV4 *bpflib.PerfMap
 	perfMapIPV6 *bpflib.PerfMap
 	stopChan    chan struct{}
@@ -23,15 +26,8 @@ type Tracer struct {
 // amount of processes blocked on the accept syscall).
 const maxActive = 128
 
-func TracerAsset() ([]byte, error) {
-	buf, err := Asset("tcptracer-ebpf.o")
-	if err != nil {
-		return nil, fmt.Errorf("couldn't find asset: %s", err)
-	}
-	return buf, nil
-}
-
-func NewTracer(cb Callback) (*Tracer, error) {
+// New sets up a new Tracer.
+func New() (Tracer, error) {
 	buf, err := Asset("tcptracer-ebpf.o")
 	if err != nil {
 		return nil, fmt.Errorf("couldn't find asset: %s", err)
@@ -75,6 +71,16 @@ func NewTracer(cb Callback) (*Tracer, error) {
 
 	stopChan := make(chan struct{})
 
+	t := &tracer{
+		m:           m,
+		eventC:      make(chan Event),
+		doneC:       make(chan struct{}),
+		perfMapIPV4: perfMapIPV4,
+		perfMapIPV6: perfMapIPV6,
+		stopChan:    stopChan,
+	}
+
+	// consume and send messages in a routine to the tracer.
 	go func() {
 		for {
 			select {
@@ -87,66 +93,62 @@ func NewTracer(cb Callback) (*Tracer, error) {
 				if !ok {
 					return // see explanation above
 				}
-				cb.TCPEventV4(tcpV4ToGo(&data))
+				t.eventC <- newEvent(tcpV4ToGo(&data))
 			case lost, ok := <-lostChanV4:
 				if !ok {
 					return // see explanation above
 				}
-				cb.LostV4(lost)
-			}
-		}
-	}()
-
-	go func() {
-		for {
-			select {
-			case <-stopChan:
-				return
+				t.eventC <- newEventError(fmt.Errorf("%d tcp IPv4 events were lost", lost))
 			case data, ok := <-channelV6:
 				if !ok {
 					return // see explanation above
 				}
-				cb.TCPEventV6(tcpV6ToGo(&data))
+				t.eventC <- newEvent(tcpV6ToGo(&data))
 			case lost, ok := <-lostChanV6:
 				if !ok {
 					return // see explanation above
 				}
-				cb.LostV6(lost)
+				t.eventC <- newEventError(fmt.Errorf("%d tcp IPv6 events were lost", lost))
 			}
 		}
 	}()
 
-	return &Tracer{
-		m:           m,
-		perfMapIPV4: perfMapIPV4,
-		perfMapIPV6: perfMapIPV6,
-		stopChan:    stopChan,
-	}, nil
+	return t, nil
 }
 
-func (t *Tracer) Start() {
+// Events returns a channel of events to range from.
+// The Event type returned holds both events and any errors that occur.
+func (t *tracer) Events() <-chan Event {
+	return t.eventC
+}
+
+// Start starts a poll into the TCP perfMaps for new connection info.
+// A Tracer should be closed with Close().
+func (t *tracer) Start() {
 	t.perfMapIPV4.PollStart()
 	t.perfMapIPV6.PollStart()
 }
 
-func (t *Tracer) AddFdInstallWatcher(pid uint32) (err error) {
-	var one uint32 = 1
-	mapFdInstall := t.m.Map("fdinstall_pids")
-	err = t.m.UpdateElement(mapFdInstall, unsafe.Pointer(&pid), unsafe.Pointer(&one), 0)
-	return err
+// Closed returns whether or not the channel has closed.
+func (t *tracer) Closed() <-chan struct{} {
+	return t.doneC
 }
 
-func (t *Tracer) RemoveFdInstallWatcher(pid uint32) (err error) {
-	mapFdInstall := t.m.Map("fdinstall_pids")
-	err = t.m.DeleteElement(mapFdInstall, unsafe.Pointer(&pid))
-	return err
-}
-
-func (t *Tracer) Stop() {
-	close(t.stopChan)
+// Close closes the Tracer.
+func (t *tracer) Close() {
 	t.perfMapIPV4.PollStop()
 	t.perfMapIPV6.PollStop()
 	t.m.Close()
+	close(t.stopChan)
+	close(t.eventC)
+	close(t.doneC)
+}
+
+func (t *tracer) AddFdInstallWatcher(pid uint32) (err error) {
+    var one uint32 = 1
+    mapFdInstall := t.m.Map("fdinstall_pids")
+    err = t.m.UpdateElement(mapFdInstall, unsafe.Pointer(&pid), unsafe.Pointer(&one), 0)
+    return err
 }
 
 func initialize(module *bpflib.Module, eventMapName string, eventChan chan []byte, lostChan chan uint64) (*bpflib.PerfMap, error) {
@@ -160,7 +162,6 @@ func initialize(module *bpflib.Module, eventMapName string, eventChan chan []byt
 	}
 
 	return pm, nil
-
 }
 
 func initializeIPv4(module *bpflib.Module, eventChan chan []byte, lostChan chan uint64) (*bpflib.PerfMap, error) {
